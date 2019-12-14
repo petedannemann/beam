@@ -15,18 +15,23 @@
 # limitations under the License.
 #
 """This module implements IO classes to read and write data to MySQL.
+
+
 Read from MySQL
-TODO: Update this section
 -----------------
-:class:`ReadFromMongoDB` is a ``PTransform`` that reads from a configured
-MongoDB source and returns a ``PCollection`` of dict representing MongoDB
-documents.
-To configure MongoDB source, the URI to connect to MongoDB server, database
-name, collection name needs to be provided.
+:class:`ReadFromMysql` is a ``PTransform`` that reads from a configured
+MySQL source and returns a ``PCollection`` of dict representing MySQL
+rows.
+To configure MySQL source, the username, password, host, database, and
+destination table needs to be provided.
 Example usage::
-  pipeline | ReadFromMongoDB(uri='mongodb://localhost:27017',
-                             db='testdb',
-                             coll='input')
+  pipeline | ReadFromMySQL(username='user',
+                           password='password',
+                           host='localhost',
+                           port=3306,
+                           database='testdb',
+                           table='output',
+                           batch_size=1000)
 
 
 Write to MySQL:
@@ -62,15 +67,15 @@ class WriteToMysql(beam.PTransform):
   """ A transform to write to the MySql Table.
   A PTransform that write a list of `DirectRow` into the Mysql Table
   """
-  def __init__(self, user, password, host, port, database, table, batch_size=100, extra_client_params=None):
+  def __init__(self, user, password, host, database, table, port=3306, batch_size=100, extra_client_params=None):
     """ Constructor of the Write connector of MySQL
     Args:
       user(str): MySQL user to connect with
       password(str): MySQL password to connect with
       host(str): MySQL host to connect to
-      port(int): MySQL port to connect to
       database(str): Name of the database on the MySQL database server to connect to
       table_(str): MySQL Table to write the `DirectRows`
+      port(int): Optional MySQL port to connect to, defaults to standard MySQL port
       batch_size(int): Number of rows per bulk_write to write to MySQL, default to 100
       extra_client_params(dict): Optional `pymysql.connections.Connection
         https://pymysql.readthedocs.io/en/latest/modules/connections.html` parameters as
@@ -83,9 +88,9 @@ class WriteToMysql(beam.PTransform):
     self.beam_options = {'user': user,
                          'password': password,
                          'host': host,
-                         'port': port,
                          'database': database,
                          'table': table,
+                         'port': port,
                          'batch_size': batch_size,
                          'extra_client_params': extra_client_params}
 
