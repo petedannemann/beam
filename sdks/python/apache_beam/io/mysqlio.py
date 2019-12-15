@@ -197,8 +197,6 @@ class _MySQLSink(object):
     self.connection = None
     self.columns = None
     self._insert_stmt = None
-    self._columns_fmt = None
-    self._values_fmt = None
 
   def write(self, batch):
     _LOGGER.debug('Batch to insert %s', batch)
@@ -225,29 +223,18 @@ class _MySQLSink(object):
   def insert_stmt(self):
     if self._insert_stmt is None:
       # TODO: Figure out how to prepare this statement or analyze it for SQL injection
+      columns_fmt = ', '.join(self.columns)
+      values_fmt = ', '.join(['%(' + col + ')s' for col in self.columns])
       insert_stmt = """
       INSERT INTO {table}
       ({columns_fmt})
       VALUES ({values_fmt})
       """.format(table=self.table,
-                 columns_fmt=self.columns_fmt,
-                 values_fmt=self.values_fmt)
+                 columns_fmt=columns_fmt,
+                 values_fmt=values_fmt)
       _LOGGER.debug('Prepared insert statement %s', insert_stmt)
       self._insert_stmt = insert_stmt
     return self._insert_stmt
-
-  @property
-  def columns_fmt(self):
-    if self._columns_fmt is None:
-      self._column_fmt = ', '.join(self.columns)
-    return self._column_fmt
-
-  @property
-  def values_fmt(self):
-    if self._values_fmt is None:
-      value_fmt = ', '.join(['%(' + col + ')s' for col in self.columns])
-      self._values_fmt = value_fmt
-    return self._values_fmt
 
   def _get_columns(self,
                    cursor # type: pymysql.connections.Cursor,
