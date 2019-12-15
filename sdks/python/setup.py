@@ -138,6 +138,7 @@ REQUIRED_PACKAGES = [
     'avro>=1.8.1,<2.0.0; python_version < "3.0"',
     'avro-python3>=1.8.1,<2.0.0; python_version >= "3.0"',
     'crcmod>=1.7,<2.0',
+    'cryptography<=2.8',
     # Dill doesn't guarantee compatibility between releases within minor version.
     # See: https://github.com/uqfoundation/dill/issues/341.
     'dill>=0.3.1.1,<0.3.2',
@@ -150,6 +151,7 @@ REQUIRED_PACKAGES = [
     'httplib2>=0.8,<=0.12.0',
     'mock>=1.0.1,<3.0.0',
     'numpy>=1.14.3,<2',
+    'PyMySQL>=0.9.3',
     'pymongo>=3.8.0,<4.0.0',
     'oauth2client>=2.0.1,<4',
     'protobuf>=3.5.0.post1,<4',
@@ -178,7 +180,6 @@ REQUIRED_TEST_PACKAGES = [
     'pandas>=0.23.4,<0.25',
     'parameterized>=0.6.0,<0.7.0',
     'pyhamcrest>=1.9,<2.0',
-    'PyMySQL>=0.9.3',
     'pyyaml>=3.12,<6.0.0',
     'requests_mock>=1.7,<2.0',
     'tenacity>=5.0.2,<6.0',

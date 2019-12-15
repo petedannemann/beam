@@ -53,17 +53,19 @@ No backward compatibility guarantees. Everything in this module is experimental.
 import json
 import logging
 
+import pymysql
+
 import apache_beam as beam
 from apache_beam.metrics import Metrics
+from apache_beam.transforms import DoFn
+from apache_beam.transforms import PTransform
 from apache_beam.utils.annotations import experimental
-
-import pymysql.connections.Connection
 
 _LOGGER = logging.getLogger(__name__)
 
 
 @experimental()
-class WriteToMysql(beam.PTransform):
+class WriteToMysql(PTransform):
   """ A transform to write to the MySql Table.
   A PTransform that write a list of `DirectRow` into the Mysql Table
   """
@@ -75,13 +77,12 @@ class WriteToMysql(beam.PTransform):
       host(str): MySQL host to connect to
       database(str): Name of the database on the MySQL database server to connect to
       table_(str): MySQL Table to write the `DirectRows`
-      port(int): Optional MySQL port to connect to, defaults to standard MySQL port
+      port(int): Optional MySQL port to connect to, defaults to standard MySQL port 3306
       batch_size(int): Number of rows per bulk_write to write to MySQL, default to 100
       extra_client_params(dict): Optional `pymysql.connections.Connection
         https://pymysql.readthedocs.io/en/latest/modules/connections.html` parameters as
         keyword arguments
     """
-    super(WriteToMysql, self).__init__()
     if extra_client_params is None:
       extra_client_params = {}
 
@@ -101,7 +102,7 @@ class WriteToMysql(beam.PTransform):
             )
 
 
-class _MysqlWriteFn(beam.DoFn):
+class _MysqlWriteFn(DoFn):
   """ Creates the connector can call and add_row to the batcher using each
   row in beam pipe line
   Args:
@@ -163,6 +164,7 @@ class _MysqlWriteFn(beam.DoFn):
             host=self.host,
             port=self.port,
             database=self.database,
+            table=self.table,
             **self.extra_client_params,
     ) as sink:
       sink.write(self.batch)
@@ -193,39 +195,84 @@ class _MySQLSink(object):
     self.extra_client_params = extra_client_params
 
     self.connection = None
+    self.columns = None
+    self._insert_stmt = None
+    self._columns_fmt = None
+    self._values_fmt = None
 
   def write(self, batch):
+    _LOGGER.debug('Batch to insert %s', batch)
     if self.connection is None:
-      self.connection = pymysql.connections.Connection(
+      self.connection = pymysql.connect(
         user=self.user,
         password=self.password,
         host=self.host,
         port=self.port,
         database=self.database,
-        **self.spec,
+        **self.extra_client_params,
       )
     with self.connection.cursor() as cursor:
-      sql = "INSERT INTO %(table)s %(cols)s values %(values)s"
-      params = {
-        'table': self.table,
-        'cols': ' ,'.join(self.cols),
-        'values': batch,
-      }
-      cursor.executemany(sql, params)
+      if self.columns is None:
+        self._get_columns(cursor)
+
+      cursor.executemany(self.insert_stmt, batch)
       self.connection.commit()
 
     # TODO: Write better debug message and retry writes
     _LOGGER.debug('BulkWrite to MySQL successful')
 
+  @property
+  def insert_stmt(self):
+    if self._insert_stmt is None:
+      # TODO: Figure out how to prepare this statement or analyze it for SQL injection
+      insert_stmt = """
+      INSERT INTO {table}
+      ({columns_fmt})
+      VALUES ({values_fmt})
+      """.format(table=self.table,
+                 columns_fmt=self.columns_fmt,
+                 values_fmt=self.values_fmt)
+      _LOGGER.debug('Prepared insert statement %s', insert_stmt)
+      self._insert_stmt = insert_stmt
+    return self._insert_stmt
+
+  @property
+  def columns_fmt(self):
+    if self._columns_fmt is None:
+      self._column_fmt = ', '.join(self.columns)
+    return self._column_fmt
+
+  @property
+  def values_fmt(self):
+    if self._values_fmt is None:
+      value_fmt = ', '.join(['%(' + col + ')s' for col in self.columns])
+      self._values_fmt = value_fmt
+    return self._values_fmt
+
+  def _get_columns(self,
+                   cursor # type: pymysql.connections.Cursor,
+                   ):
+    sql = """
+            SELECT `COLUMN_NAME` FROM `INFORMATION_SCHEMA`.`COLUMNS`
+            WHERE `TABLE_SCHEMA` = '{database}'
+            AND `TABLE_NAME` = '{table}'
+            ORDER BY `TABLE_NAME`, `ORDINAL_POSITION`""".format(
+      database=self.database, table=self.table)
+    _LOGGER.debug('Executing SQL statement to get columns: %s', sql)
+    cursor.execute(sql)
+    columns = [col[0] for col in cursor.fetchall()]
+    self.columns = columns
+    _LOGGER.debug('Using columns %s', self.columns)
+
   def __enter__(self):
     if self.connection is None:
-      self.connection = pymysql.connections.Connection(
+      self.connection = pymysql.connect(
         user=self.user,
         password=self.password,
         host=self.host,
         port=self.port,
         database=self.database,
-        **self.spec,
+        **self.extra_client_params,
       )
     return self
 
