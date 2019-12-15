@@ -79,7 +79,7 @@ class WriteToMysql(PTransform):
       table_(str): MySQL Table to write the `DirectRows`
       port(int): Optional MySQL port to connect to, defaults to standard MySQL port 3306
       batch_size(int): Number of rows per bulk_write to write to MySQL, default to 100
-      extra_client_params(dict): Optional `pymysql.connections.Connection
+      extra_client_params(dict): Optional `pymysql.connect
         https://pymysql.readthedocs.io/en/latest/modules/connections.html` parameters as
         keyword arguments
     """
@@ -113,7 +113,7 @@ class _MysqlWriteFn(DoFn):
     database(str): Name of the database on the MySQL database server to connect to
     table(str): MySQL Table to write the `DirectRows`
     batch_size(int): Number of rows per bulk_write to write to MySQL
-    extra_client_params(dict): `pymysql.connections.Connection
+    extra_client_params(dict): `pymysql.connect
         https://pymysql.readthedocs.io/en/latest/modules/connections.html` parameters as
         keyword arguments
   """
@@ -128,7 +128,7 @@ class _MysqlWriteFn(DoFn):
       database(str): Name of the database on the MySQL database server to connect to
       table_(str): MySQL Table to write the `DirectRows`
       batch_size(int): Number of rows per bulk_write to write to MySQL
-      extra_client_params(dict): `pymysql.connections.Connection
+      extra_client_params(dict): `pymysql.connect
         https://pymysql.readthedocs.io/en/latest/modules/connections.html` parameters as
         keyword arguments
     """
