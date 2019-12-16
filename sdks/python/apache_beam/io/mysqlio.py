@@ -53,9 +53,11 @@ No backward compatibility guarantees. Everything in this module is experimental.
 import json
 import logging
 
+import numpy as np
 import pymysql
 
 import apache_beam as beam
+from apache_beam.io import iobase
 from apache_beam.metrics import Metrics
 from apache_beam.transforms import DoFn
 from apache_beam.transforms import PTransform
@@ -63,13 +65,167 @@ from apache_beam.utils.annotations import experimental
 
 _LOGGER = logging.getLogger(__name__)
 
+__all__ = ['ReadFromMysql', 'WriteToMysql']
+
+
+@experimental()
+class ReadFromMysql(PTransform):
+  """A ``PTransfrom`` to read MySQL rows into a ``PCollection``.
+  """
+
+  def __init__(self,
+               user, # type: str
+               password, # type: str
+               host, # type: str
+               database, # type: str
+               table, # type: str
+               port=3306, # type: Optional[int]
+               extra_client_params=None, # type: Optional[Dict]
+               ):
+    """ Constructor of the Read connector of MySQL
+
+    Args:
+      user(str): MySQL user to connect with
+      password(str): MySQL password to connect with
+      host(str): MySQL host to connect to
+      database(str): Name of the database on the MySQL database server to connect to
+      table_(str): MySQL Table to write the `DirectRows`
+      port(int): Optional MySQL port to connect to, defaults to standard MySQL port 3306
+      extra_client_params(dict): Optional `pymysql.connect
+        https://pymysql.readthedocs.io/en/latest/modules/connections.html` parameters as
+        keyword arguments
+
+    Returns:
+      :class:`~apache_beam.transforms.ptransform.PTransform`
+    """
+    if extra_client_params is None:
+      extra_client_params = {}
+
+    self.beam_options = {'user': user,
+                         'password': password,
+                         'host': host,
+                         'database': database,
+                         'table': table,
+                         'port': port,
+                         'extra_client_params': extra_client_params}
+    self._mysql_source = _BoundedMysqlSource(**self.beam_options)
+
+  def expand(self, pcoll):
+    return pcoll | iobase.Read(self._mysql_source)
+
+
+class _BoundedMysqlSource(iobase.BoundedSource):
+  def __init__(self,
+               user=None,
+               password=None,
+               host=None,
+               database=None,
+               table=None,
+               port=None,
+               extra_client_params=None):
+    if extra_client_params is None:
+      extra_client_params = {}
+
+    self.user = user
+    self.password = password
+    self.host = host
+    self.database = database
+    self.table = table
+    self.port = port
+    self.extra_client_params = extra_client_params
+
+  def estimate_size(self):  # type: () -> Optional[int]
+    with pymysql.connect(user=self.user,
+                         password=self.password,
+                         host=self.host,
+                         port=self.port,
+                         database=self.database,
+                         **self.extra_client_params,
+    ) as cursor:
+      sql = "SELECT COUNT(*) FROM {table}".format(table=self.table)
+      return cursor.execute(sql) \
+                   .fetchone()[0]
+
+  def split(self,
+            desired_bundle_size, # type: int
+            start_position=None, # type: Optional[int]
+            stop_position=None, # type: Optional[int]
+            ):
+    start_position, stop_position = self._replace_none_positions(
+      start_position, stop_position)
+
+    split_ranges = np.arange(start_position, stop_position, desired_bundle_size)
+
+    bundle_start = start_position
+    for split_range in split_ranges:
+      if bundle_start >= stop_position:
+        break
+      bundle_end = min(stop_position, split_range)
+      yield iobase.SourceBundle(weight=desired_bundle_size,
+                                source=self,
+                                start_position=bundle_start,
+                                stop_position=bundle_end)
+      bundle_start = bundle_end
+    if bundle_start < stop_position:
+      yield iobase.SourceBundle(weight=desired_bundle_size,
+                                source=self,
+                                start_position=bundle_start,
+                                stop_position=stop_position)
+
+  def get_range_tracker(self, start_position, stop_position):
+    start_position, stop_position = self._replace_none_positions(
+      start_position, stop_position)
+    return _ObjectIdRangeTracker(start_position, stop_position)
+
+  def read(self, range_tracker):
+    with pymysql.connect(user=self.user,
+                         password=self.password,
+                         host=self.host,
+                         port=self.port,
+                         database=self.database,
+                         **self.extra_client_params,
+                         ) as cursor:
+      raise NotImplementedError
+      for doc in docs_cursor:
+        if not range_tracker.try_claim(doc['_id']):
+          return
+        yield doc
+
+  def display_data(self):
+    res = super(_BoundedMysqlSource, self).display_data()
+    res['user'] = self.user
+    res['host'] = self.host
+    res['port'] = self.port
+    res['database'] = self.database
+    res['table'] = self.table
+    res['extra_client_params'] = json.dumps(self.extra_client_params)
+    return res
+
+  def _replace_none_positions(self, start_position, stop_position):
+    if start_position is None:
+      start_position = 0
+    if stop_position is None:
+      size = self.estimate_size()
+      # increment last value by 1 to make sure the last row
+      # is not excluded
+      stop_position = size + 1
+    return start_position, stop_position
+
 
 @experimental()
 class WriteToMysql(PTransform):
   """ A transform to write to the MySql Table.
   A PTransform that write a list of `DirectRow` into the Mysql Table
   """
-  def __init__(self, user, password, host, database, table, port=3306, batch_size=100, extra_client_params=None):
+  def __init__(self,
+               user=None,
+               password=None,
+               host=None,
+               database=None,
+               table=None,
+               port=None,
+               batch_size=100,
+               extra_client_params=None):
     """ Constructor of the Write connector of MySQL
     Args:
       user(str): MySQL user to connect with
@@ -118,7 +274,15 @@ class _MysqlWriteFn(DoFn):
         keyword arguments
   """
 
-  def __init__(self, user, password, host, port, database, table, batch_size, extra_client_params):
+  def __init__(self,
+               user,
+               password,
+               host,
+               port,
+               database,
+               table,
+               batch_size,
+               extra_client_params):
     """Constructor of the Write connector of MySQL
     Args:
       user(str): MySQL user to connect with
@@ -183,7 +347,14 @@ class _MysqlWriteFn(DoFn):
 
 
 class _MySQLSink(object):
-  def __init__(self, user, password, host, port, database, table, extra_client_params=None):
+  def __init__(self,
+               user,
+               password,
+               host,
+               port,
+               database,
+               table,
+               extra_client_params=None):
     if extra_client_params is None:
       extra_client_params = {}
     self.user = user
@@ -196,7 +367,7 @@ class _MySQLSink(object):
 
     self.connection = None
     self.columns = None
-    self._insert_stmt = None
+    self._upsert_stmt = None
 
   def write(self, batch):
     _LOGGER.debug('Batch to insert %s', batch)
@@ -213,38 +384,44 @@ class _MySQLSink(object):
       if self.columns is None:
         self._get_columns(cursor)
 
-      cursor.executemany(self.insert_stmt, batch)
+      cursor.executemany(self.upsert_stmt, batch)
       self.connection.commit()
 
     # TODO: Write better debug message and retry writes
     _LOGGER.debug('BulkWrite to MySQL successful')
 
   @property
-  def insert_stmt(self):
-    if self._insert_stmt is None:
-      # TODO: Figure out how to prepare this statement or analyze it for SQL injection
+  def upsert_stmt(self):
+    if self._upsert_stmt is None:
       columns_fmt = ', '.join(self.columns)
       values_fmt = ', '.join(['%(' + col + ')s' for col in self.columns])
-      insert_stmt = """
+      update_fmt = ', '.join(['`%(col)s`=VALUES(`%(col)s`)' % {'col': col} for col in self.columns])
+      upsert_stmt = """
       INSERT INTO {table}
       ({columns_fmt})
       VALUES ({values_fmt})
+      ON DUPLICATE KEY UPDATE {update_fmt}
       """.format(table=self.table,
                  columns_fmt=columns_fmt,
-                 values_fmt=values_fmt)
-      _LOGGER.debug('Prepared insert statement %s', insert_stmt)
-      self._insert_stmt = insert_stmt
-    return self._insert_stmt
+                 values_fmt=values_fmt,
+                 update_fmt=update_fmt)
+      _LOGGER.debug('Prepared upsert statement %s', upsert_stmt)
+      self._upsert_stmt = upsert_stmt
+    return self._upsert_stmt
 
   def _get_columns(self,
                    cursor # type: pymysql.connections.Cursor,
                    ):
     sql = """
-            SELECT `COLUMN_NAME` FROM `INFORMATION_SCHEMA`.`COLUMNS`
-            WHERE `TABLE_SCHEMA` = '{database}'
-            AND `TABLE_NAME` = '{table}'
-            ORDER BY `TABLE_NAME`, `ORDINAL_POSITION`""".format(
+      SELECT `COLUMN_NAME` FROM `INFORMATION_SCHEMA`.`COLUMNS`
+      WHERE `TABLE_SCHEMA` = '{database}'
+      AND `TABLE_NAME` = '{table}'
+      AND `EXTRA` NOT LIKE '%auto_increment%'
+      ORDER BY `TABLE_NAME`, `ORDINAL_POSITION`
+      """.format(
       database=self.database, table=self.table)
+    # This ignores auto incrementing columns as they will not be included in
+    # the upsert statement
     _LOGGER.debug('Executing SQL statement to get columns: %s', sql)
     cursor.execute(sql)
     columns = [col[0] for col in cursor.fetchall()]
