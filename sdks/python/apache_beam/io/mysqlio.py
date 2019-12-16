@@ -69,7 +69,6 @@ _LOGGER = logging.getLogger(__name__)
 
 __all__ = ['ReadFromMysql', 'WriteToMysql']
 
-
 @experimental()
 class ReadFromMysql(PTransform):
   """A ``PTransfrom`` to read MySQL rows into a ``PCollection``.
@@ -104,6 +103,7 @@ class ReadFromMysql(PTransform):
     Returns:
       :class:`~apache_beam.transforms.ptransform.PTransform`
     """
+    # TODO: Allow passing in your own sql statement
     if extra_client_params is None:
       extra_client_params = {}
 
@@ -160,7 +160,6 @@ class _BoundedMysqlSource(iobase.BoundedSource):
       sql = "SELECT COUNT(*) FROM {table}".format(table=self.table)
       cursor.execute(sql)
       result = cursor.fetchone()[0]
-      print(result)
       return result
 
   def split(self,
@@ -460,6 +459,7 @@ class _MySQLSink(object):
 
   @property
   def upsert_stmt(self):
+    # TODO: include pk column in upsert
     if self._upsert_stmt is None:
       columns_fmt = ', '.join(self.columns)
       values_fmt = ', '.join(['%(' + col + ')s' for col in self.columns])
