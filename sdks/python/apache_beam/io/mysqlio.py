@@ -52,12 +52,14 @@ No backward compatibility guarantees. Everything in this module is experimental.
 """
 import json
 import logging
+import warnings
 
 import numpy as np
 import pymysql
 
 import apache_beam as beam
 from apache_beam.io import iobase
+from apache_beam.io.range_trackers import OrderedPositionRangeTracker, UnsplittableRangeTracker
 from apache_beam.metrics import Metrics
 from apache_beam.transforms import DoFn
 from apache_beam.transforms import PTransform
@@ -81,6 +83,7 @@ class ReadFromMysql(PTransform):
                table, # type: str
                port=3306, # type: Optional[int]
                extra_client_params=None, # type: Optional[Dict]
+               ordering_col=None, # type: Optiona[str]
                ):
     """ Constructor of the Read connector of MySQL
 
@@ -94,6 +97,9 @@ class ReadFromMysql(PTransform):
       extra_client_params(dict): Optional `pymysql.connect
         https://pymysql.readthedocs.io/en/latest/modules/connections.html` parameters as
         keyword arguments
+      ordering_col(str): Optional column to use for ordering if there is no primary key.
+        Warning, if data is written to the database when using this, the data might be
+        missed. It's best to use a primary key.
 
     Returns:
       :class:`~apache_beam.transforms.ptransform.PTransform`
@@ -101,13 +107,18 @@ class ReadFromMysql(PTransform):
     if extra_client_params is None:
       extra_client_params = {}
 
+    if ordering_col is not None:
+      warnings.warn('You are using an ordering column to determine splits. This may'
+                    'result in data being lost if writes happen during reads.', ResourceWarning)
+
     self.beam_options = {'user': user,
                          'password': password,
                          'host': host,
                          'database': database,
                          'table': table,
                          'port': port,
-                         'extra_client_params': extra_client_params}
+                         'extra_client_params': extra_client_params,
+                         'ordering_col': ordering_col}
     self._mysql_source = _BoundedMysqlSource(**self.beam_options)
 
   def expand(self, pcoll):
@@ -122,7 +133,8 @@ class _BoundedMysqlSource(iobase.BoundedSource):
                database=None,
                table=None,
                port=None,
-               extra_client_params=None):
+               extra_client_params=None,
+               ordering_col=None):
     if extra_client_params is None:
       extra_client_params = {}
 
@@ -133,6 +145,9 @@ class _BoundedMysqlSource(iobase.BoundedSource):
     self.table = table
     self.port = port
     self.extra_client_params = extra_client_params
+    self.ordering_col = ordering_col
+
+    self._primary_key = None
 
   def estimate_size(self):  # type: () -> Optional[int]
     with pymysql.connect(user=self.user,
@@ -143,8 +158,10 @@ class _BoundedMysqlSource(iobase.BoundedSource):
                          **self.extra_client_params,
     ) as cursor:
       sql = "SELECT COUNT(*) FROM {table}".format(table=self.table)
-      return cursor.execute(sql) \
-                   .fetchone()[0]
+      cursor.execute(sql)
+      result = cursor.fetchone()[0]
+      print(result)
+      return result
 
   def split(self,
             desired_bundle_size, # type: int
@@ -175,21 +192,40 @@ class _BoundedMysqlSource(iobase.BoundedSource):
   def get_range_tracker(self, start_position, stop_position):
     start_position, stop_position = self._replace_none_positions(
       start_position, stop_position)
-    return _ObjectIdRangeTracker(start_position, stop_position)
+    range_tracker = OrderedPositionRangeTracker(start_position, stop_position)
+    if self.primary_key or self.ordering_col:
+      return range_tracker
+    return UnsplittableRangeTracker(range_tracker)
 
-  def read(self, range_tracker):
+  def read(self,
+           range_tracker, # type: OrderedPositionRangeTracker
+           ):
+    start = range_tracker.start_position()
+    stop = range_tracker.stop_position()
+    bundle_size = stop - start
+    sql = """
+    SELECT * 
+    FROM {table}
+    ORDER BY {order_col} ASC
+    LIMIT {bundle_size}
+    OFFSET {start}
+    """.format(table=self.table,
+               order_col=self.order_col,
+               bundle_size=bundle_size,
+               start=start,
+               )
+    _LOGGER.debug('Reading using sql: %s', sql)
     with pymysql.connect(user=self.user,
                          password=self.password,
                          host=self.host,
                          port=self.port,
                          database=self.database,
+                         cursorclass=pymysql.cursors.DictCursor,
                          **self.extra_client_params,
                          ) as cursor:
-      raise NotImplementedError
-      for doc in docs_cursor:
-        if not range_tracker.try_claim(doc['_id']):
-          return
-        yield doc
+      cursor.execute(sql)
+      result = cursor.fetchall()
+      return result
 
   def display_data(self):
     res = super(_BoundedMysqlSource, self).display_data()
@@ -199,7 +235,38 @@ class _BoundedMysqlSource(iobase.BoundedSource):
     res['database'] = self.database
     res['table'] = self.table
     res['extra_client_params'] = json.dumps(self.extra_client_params)
+    res['ordering_col'] = self.ordering_col
     return res
+
+  @property
+  def primary_key(self):
+    if self._primary_key is None:
+      sql = """
+      SELECT COLUMN_NAME
+      FROM INFORMATION_SCHEMA.COLUMNS
+      WHERE TABLE_SCHEMA = SCHEMA()
+       AND TABLE_NAME = '{table}'
+       AND COLUMN_KEY = 'PRI'
+      """.format(table=self.table)
+      _LOGGER.debug('Finding primary key using sql: %s', sql)
+
+      with pymysql.connect(user=self.user,
+                           password=self.password,
+                           host=self.host,
+                           port=self.port,
+                           database=self.database,
+                           **self.extra_client_params,
+                           ) as cursor:
+        cursor.execute(sql)
+        self._primary_key = cursor.fetchone()[0]
+        _LOGGER.debug('Primary key for %s is %s', self.table, self.primary_key)
+    return self._primary_key
+
+  @property
+  def order_col(self):
+    if self.ordering_col is not None:
+      return self.ordering_col
+    return self.primary_key
 
   def _replace_none_positions(self, start_position, stop_position):
     if start_position is None:
@@ -275,14 +342,15 @@ class _MysqlWriteFn(DoFn):
   """
 
   def __init__(self,
-               user,
-               password,
-               host,
-               port,
-               database,
-               table,
-               batch_size,
-               extra_client_params):
+               user, # type: str
+               password, # type: str
+               host, # type: str
+               port, # type: int
+               database, # type: str
+               table, # type: str
+               batch_size, # type: Optional[int]
+               extra_client_params # type: Optional[Dict]
+               ):
     """Constructor of the Write connector of MySQL
     Args:
       user(str): MySQL user to connect with
@@ -348,13 +416,14 @@ class _MysqlWriteFn(DoFn):
 
 class _MySQLSink(object):
   def __init__(self,
-               user,
-               password,
-               host,
-               port,
-               database,
-               table,
-               extra_client_params=None):
+               user, # type: str
+               password, # type: str
+               host, # type: str
+               port, # type: int
+               database, # type: str
+               table, # type: str
+               extra_client_params=None,  # type: Optional[Dict]
+               ):
     if extra_client_params is None:
       extra_client_params = {}
     self.user = user
@@ -385,7 +454,6 @@ class _MySQLSink(object):
         self._get_columns(cursor)
 
       cursor.executemany(self.upsert_stmt, batch)
-      self.connection.commit()
 
     # TODO: Write better debug message and retry writes
     _LOGGER.debug('BulkWrite to MySQL successful')
@@ -442,4 +510,5 @@ class _MySQLSink(object):
 
   def __exit__(self, exc_type, exc_val, exc_tb):
     if self.connection is not None:
+      self.connection.commit()
       self.connection.close()

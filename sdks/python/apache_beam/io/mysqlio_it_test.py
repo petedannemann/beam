@@ -141,26 +141,25 @@ def run(argv=None):
                (known_args.num_rows, elapsed))
 
   # Test Read from MySQL
-  # with TestPipeline(options=PipelineOptions(pipeline_args)) as p:
-  #   start_time = time.time()
-  #   _LOGGER.info('Reading from MySQL %s:%s' %
-  #                (known_args.mysql_database, known_args.table))
-  #   r = (p | 'ReadFromMysql' >> beam.io.ReadFromMysql((known_args.mysql_user,
-  #                                                      known_args.mysql_password,
-  #                                                      known_args.mysql_host,
-  #                                                      known_args.mysql_database,
-  #                                                      known_args.table,
-  #                                                      known_args.mysql_port,
-  #                                                      known_args.batch_size,
-  #                                                      ))
-  #          | 'Map' >> beam.Map(lambda doc: doc['number'])
-  #          | 'Combine' >> beam.CombineGlobally(sum))
-  #   assert_that(
-  #       r, equal_to([sum(range(known_args.num_rows))]))
-  #
-  # elapsed = time.time() - start_time
-  # _LOGGER.info('Read %d rows from MySQL finished in %.3f seconds' %
-  #              (known_args.num_rows, elapsed))
+  with TestPipeline(options=PipelineOptions(pipeline_args)) as p:
+    start_time = time.time()
+    _LOGGER.info('Reading from MySQL %s:%s' %
+                 (known_args.mysql_database, known_args.table))
+    r = (p | 'ReadFromMysql' >> beam.io.ReadFromMysql(known_args.mysql_user,
+                                                       known_args.mysql_password,
+                                                       known_args.mysql_host,
+                                                       known_args.mysql_database,
+                                                       known_args.table,
+                                                       known_args.mysql_port,
+                                                       )
+           | 'Map' >> beam.Map(lambda row: row['number'])
+           | 'Combine' >> beam.CombineGlobally(sum))
+    assert_that(
+        r, equal_to([sum(range(known_args.num_rows))]))
+
+  elapsed = time.time() - start_time
+  _LOGGER.info('Read %d rows from MySQL finished in %.3f seconds' %
+               (known_args.num_rows, elapsed))
 
   teardown_mysql(user=known_args.mysql_user,
                  password=known_args.mysql_password,
