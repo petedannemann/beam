@@ -82,7 +82,8 @@ class ReadFromMysql(PTransform):
                database, # type: str
                table, # type: str
                port=3306, # type: Optional[int]
-               columns=None,  # type: List[str]
+               columns=None,  # type: Optional[List[str]]
+               sql=None, # type: Optional[str]
                extra_client_params=None, # type: Optional[Dict]
                ordering_col=None, # type: Optional[str]
                ):
@@ -93,9 +94,10 @@ class ReadFromMysql(PTransform):
       password(str): MySQL password to connect with
       host(str): MySQL host to connect to
       database(str): Name of the database on the MySQL database server to connect to
-      table_(str): MySQL Table to write the `DirectRows`
+      table(str): MySQL Table to write the `DirectRows`
       port(int): Optional MySQL port to connect to, defaults to standard MySQL port 3306
-      columns (List[str]): A list of columns to select from the table
+      columns(List[str]): Optional list of columns to select from the table
+      sql(str): Optional SQL query statement
       extra_client_params(dict): Optional `pymysql.connect
         https://pymysql.readthedocs.io/en/latest/modules/connections.html` parameters as
         keyword arguments
@@ -106,7 +108,6 @@ class ReadFromMysql(PTransform):
     Returns:
       :class:`~apache_beam.transforms.ptransform.PTransform`
     """
-    # TODO: Allow passing in your own sql statement
     if extra_client_params is None:
       extra_client_params = {}
 
@@ -119,8 +120,9 @@ class ReadFromMysql(PTransform):
                          'host': host,
                          'database': database,
                          'table': table,
-                         'columns': columns,
                          'port': port,
+                         'columns': columns,
+                         'sql': sql,
                          'extra_client_params': extra_client_params,
                          'ordering_col': ordering_col}
     self._mysql_source = _BoundedMysqlSource(**self.beam_options)
@@ -138,6 +140,7 @@ class _BoundedMysqlSource(iobase.BoundedSource):
                table=None,
                columns=None,
                port=None,
+               sql=None,
                extra_client_params=None,
                ordering_col=None):
     if extra_client_params is None:
@@ -149,6 +152,7 @@ class _BoundedMysqlSource(iobase.BoundedSource):
     self.database = database
     self.table = table
     self.port = port
+    self.sql = sql
     self.extra_client_params = extra_client_params
     self.ordering_col = ordering_col
 
@@ -164,7 +168,13 @@ class _BoundedMysqlSource(iobase.BoundedSource):
                          database=self.database,
                          **self.extra_client_params,
     ) as cursor:
-      sql = "SELECT COUNT(*) FROM {table}".format(table=self.table)
+      if not self.sql:
+        sql = "SELECT COUNT(*) FROM {table}".format(table=self.table)
+      else:
+        sql = """
+        SELECT COUNT(*) 
+        FROM ({sql_stmt})
+        """.format(sql_stmt=self.sql)
       cursor.execute(sql)
       result = cursor.fetchone()[0]
       return result
@@ -213,6 +223,10 @@ class _BoundedMysqlSource(iobase.BoundedSource):
     # Only version 8+ supports window functions, which are significiantly
     # faster than OFFSET for large query results
     columns = ', '.join(self.columns)
+    if self.sql is not None:
+      base_table = '(%s)' % self.sql
+    else:
+      base_table = self.table
     if self.mysql_version >= 8:
       sql = """
       WITH cte AS
@@ -220,13 +234,13 @@ class _BoundedMysqlSource(iobase.BoundedSource):
         SELECT 
           *,
           ROW_NUMBER() OVER (ORDER BY {order_col}) AS row_num
-        FROM {table}
+        FROM {base_table}
       )
       SELECT {columns}
       FROM cte
       WHERE row_num >= {start}
       AND row_num <= {stop}
-      """.format(table=self.table,
+      """.format(base_table=base_table,
                  order_col=self.order_col,
                  columns=columns,
                  start=start,
@@ -240,7 +254,7 @@ class _BoundedMysqlSource(iobase.BoundedSource):
       LIMIT {bundle_size}
       OFFSET {start}
       """.format(columns=columns,
-                 table=self.table,
+                 base_table=base_table,
                  order_col=self.order_col,
                  bundle_size=bundle_size,
                  start=start,
@@ -259,6 +273,7 @@ class _BoundedMysqlSource(iobase.BoundedSource):
       return result
 
   def display_data(self):
+    # TODO: Update this with new options
     res = super(_BoundedMysqlSource, self).display_data()
     res['user'] = self.user
     res['host'] = self.host
@@ -272,26 +287,39 @@ class _BoundedMysqlSource(iobase.BoundedSource):
   @property
   def columns(self):
     if self._columns is None:
-      sql = """
-      SELECT `COLUMN_NAME` FROM `INFORMATION_SCHEMA`.`COLUMNS`
-      WHERE `TABLE_SCHEMA` = '{database}'
-      AND `TABLE_NAME` = '{table}'
-      ORDER BY `TABLE_NAME`, `ORDINAL_POSITION`
-      """.format(
-        database=self.database, table=self.table)
-      with pymysql.connect(user=self.user,
-                           password=self.password,
-                           host=self.host,
-                           port=self.port,
-                           database=self.database,
-                           **self.extra_client_params,
-                           ) as cursor:
-        cursor.execute(sql)
-        columns = [col[0] for col in cursor.fetchall()]
-        self._columns = columns
-        _LOGGER.debug('Fetched columns %s', self._columns)
+      if self.sql is not None:
+        sql = self.sql
+        extra_client_params = self.extra_client_params.pop('cursorclass')
+        with pymysql.connect(user=self.user,
+                             password=self.password,
+                             host=self.host,
+                             port=self.port,
+                             database=self.database,
+                             cursorclass=pymysql.cursors.DictCursor,
+                             **extra_client_params,
+                             ) as cursor:
+          cursor.execute(sql)
+          columns = cursor.fetchone().keys()
+      else:
+        sql = """
+        SELECT `COLUMN_NAME` FROM `INFORMATION_SCHEMA`.`COLUMNS`
+        WHERE `TABLE_SCHEMA` = '{database}'
+        AND `TABLE_NAME` = '{table}'
+        ORDER BY `TABLE_NAME`, `ORDINAL_POSITION`
+        """.format(
+          database=self.database, table=self.table)
+        with pymysql.connect(user=self.user,
+                             password=self.password,
+                             host=self.host,
+                             port=self.port,
+                             database=self.database,
+                             **self.extra_client_params,
+                             ) as cursor:
+          cursor.execute(sql)
+          columns = [col[0] for col in cursor.fetchall()]
+      self._columns = columns
+      _LOGGER.debug('Fetched columns %s', self._columns)
     return self._columns
-
 
   @property
   def primary_key(self):
