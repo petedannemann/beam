@@ -146,12 +146,12 @@ def run(argv=None):
     _LOGGER.info('Reading from MySQL %s:%s' %
                  (known_args.mysql_database, known_args.table))
     r = (p | 'ReadFromMysql' >> beam.io.ReadFromMysql(known_args.mysql_user,
-                                                       known_args.mysql_password,
-                                                       known_args.mysql_host,
-                                                       known_args.mysql_database,
-                                                       known_args.table,
-                                                       known_args.mysql_port,
-                                                       )
+                                                      known_args.mysql_password,
+                                                      known_args.mysql_host,
+                                                      known_args.mysql_database,
+                                                      known_args.table,
+                                                      known_args.mysql_port,
+                                                      )
            | 'Map' >> beam.Map(lambda row: row['number'])
            | 'Combine' >> beam.CombineGlobally(sum))
     assert_that(

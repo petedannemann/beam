@@ -31,7 +31,7 @@ Example usage::
                            port=3306,
                            database='testdb',
                            table='output',
-                           batch_size=1000)
+                           columns=['col_one', 'col_two'])
 
 
 Write to MySQL:
@@ -69,6 +69,7 @@ _LOGGER = logging.getLogger(__name__)
 
 __all__ = ['ReadFromMysql', 'WriteToMysql']
 
+
 @experimental()
 class ReadFromMysql(PTransform):
   """A ``PTransfrom`` to read MySQL rows into a ``PCollection``.
@@ -81,8 +82,9 @@ class ReadFromMysql(PTransform):
                database, # type: str
                table, # type: str
                port=3306, # type: Optional[int]
+               columns=None,  # type: List[str]
                extra_client_params=None, # type: Optional[Dict]
-               ordering_col=None, # type: Optiona[str]
+               ordering_col=None, # type: Optional[str]
                ):
     """ Constructor of the Read connector of MySQL
 
@@ -93,12 +95,13 @@ class ReadFromMysql(PTransform):
       database(str): Name of the database on the MySQL database server to connect to
       table_(str): MySQL Table to write the `DirectRows`
       port(int): Optional MySQL port to connect to, defaults to standard MySQL port 3306
+      columns (List[str]): A list of columns to select from the table
       extra_client_params(dict): Optional `pymysql.connect
         https://pymysql.readthedocs.io/en/latest/modules/connections.html` parameters as
         keyword arguments
-      ordering_col(str): Optional column to use for ordering if there is no primary key.
-        Warning, if data is written to the database when using this, the data might be
-        missed. It's best to use a primary key.
+      ordering_col(str): Optional column to use for ordering if there is no autoincrementing
+       primary key. Warning, if data is written to the database when using this, the data
+       might be missed.
 
     Returns:
       :class:`~apache_beam.transforms.ptransform.PTransform`
@@ -116,6 +119,7 @@ class ReadFromMysql(PTransform):
                          'host': host,
                          'database': database,
                          'table': table,
+                         'columns': columns,
                          'port': port,
                          'extra_client_params': extra_client_params,
                          'ordering_col': ordering_col}
@@ -132,6 +136,7 @@ class _BoundedMysqlSource(iobase.BoundedSource):
                host=None,
                database=None,
                table=None,
+               columns=None,
                port=None,
                extra_client_params=None,
                ordering_col=None):
@@ -147,7 +152,9 @@ class _BoundedMysqlSource(iobase.BoundedSource):
     self.extra_client_params = extra_client_params
     self.ordering_col = ordering_col
 
+    self._columns = columns
     self._primary_key = None
+    self._mysql_version = None
 
   def estimate_size(self):  # type: () -> Optional[int]
     with pymysql.connect(user=self.user,
@@ -202,17 +209,42 @@ class _BoundedMysqlSource(iobase.BoundedSource):
     start = range_tracker.start_position()
     stop = range_tracker.stop_position()
     bundle_size = stop - start
-    sql = """
-    SELECT * 
-    FROM {table}
-    ORDER BY {order_col} ASC
-    LIMIT {bundle_size}
-    OFFSET {start}
-    """.format(table=self.table,
-               order_col=self.order_col,
-               bundle_size=bundle_size,
-               start=start,
-               )
+
+    # Only version 8+ supports window functions, which are significiantly
+    # faster than OFFSET for large query results
+    columns = ', '.join(self.columns)
+    if self.mysql_version >= 8:
+      sql = """
+      WITH cte AS
+      (
+        SELECT 
+          *,
+          ROW_NUMBER() OVER (ORDER BY {order_col}) AS row_num
+        FROM {table}
+      )
+      SELECT {columns}
+      FROM cte
+      WHERE row_num >= {start}
+      AND row_num <= {stop}
+      """.format(table=self.table,
+                 order_col=self.order_col,
+                 columns=columns,
+                 start=start,
+                 stop=stop,
+                 )
+    else:
+      sql = """
+      SELECT {columns} 
+      FROM {table}
+      ORDER BY {order_col} ASC
+      LIMIT {bundle_size}
+      OFFSET {start}
+      """.format(columns=columns,
+                 table=self.table,
+                 order_col=self.order_col,
+                 bundle_size=bundle_size,
+                 start=start,
+                 )
     _LOGGER.debug('Reading using sql: %s', sql)
     with pymysql.connect(user=self.user,
                          password=self.password,
@@ -236,6 +268,30 @@ class _BoundedMysqlSource(iobase.BoundedSource):
     res['extra_client_params'] = json.dumps(self.extra_client_params)
     res['ordering_col'] = self.ordering_col
     return res
+
+  @property
+  def columns(self):
+    if self._columns is None:
+      sql = """
+      SELECT `COLUMN_NAME` FROM `INFORMATION_SCHEMA`.`COLUMNS`
+      WHERE `TABLE_SCHEMA` = '{database}'
+      AND `TABLE_NAME` = '{table}'
+      ORDER BY `TABLE_NAME`, `ORDINAL_POSITION`
+      """.format(
+        database=self.database, table=self.table)
+      with pymysql.connect(user=self.user,
+                           password=self.password,
+                           host=self.host,
+                           port=self.port,
+                           database=self.database,
+                           **self.extra_client_params,
+                           ) as cursor:
+        cursor.execute(sql)
+        columns = [col[0] for col in cursor.fetchall()]
+        self._columns = columns
+        _LOGGER.debug('Fetched columns %s', self._columns)
+    return self._columns
+
 
   @property
   def primary_key(self):
@@ -266,6 +322,23 @@ class _BoundedMysqlSource(iobase.BoundedSource):
     if self.ordering_col is not None:
       return self.ordering_col
     return self.primary_key
+
+  @property
+  def mysql_version(self):
+    if self._mysql_version is None:
+      sql = 'SELECT VERSION()'
+      with pymysql.connect(user=self.user,
+                           password=self.password,
+                           host=self.host,
+                           port=self.port,
+                           database=self.database,
+                           **self.extra_client_params,
+                           ) as cursor:
+        cursor.execute(sql)
+        mysql_version = cursor.fetchone()[0]
+        _LOGGER.debug('Using MySQL version %s', mysql_version)
+        self._mysql_version = int(mysql_version[0]) # Round down
+    return self._mysql_version
 
   def _replace_none_positions(self, start_position, stop_position):
     if start_position is None:
