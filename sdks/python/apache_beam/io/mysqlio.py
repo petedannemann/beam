@@ -50,6 +50,8 @@ Example usage::
 
 No backward compatibility guarantees. Everything in this module is experimental.
 """
+from contextlib import contextmanager
+import copy
 import json
 import logging
 import warnings
@@ -159,15 +161,12 @@ class _BoundedMysqlSource(iobase.BoundedSource):
     self._columns = columns
     self._primary_key = None
     self._mysql_version = None
+    self._connection = _MysqlConnectionHelper(
+      user, password, host, database, port, extra_client_params,
+    )
 
   def estimate_size(self):  # type: () -> Optional[int]
-    with pymysql.connect(user=self.user,
-                         password=self.password,
-                         host=self.host,
-                         port=self.port,
-                         database=self.database,
-                         **self.extra_client_params,
-    ) as cursor:
+    with self._connection.cursor() as cursor:
       if not self.sql:
         sql = "SELECT COUNT(*) FROM {table}".format(table=self.table)
       else:
@@ -260,14 +259,7 @@ class _BoundedMysqlSource(iobase.BoundedSource):
                  start=start,
                  )
     _LOGGER.debug('Reading using sql: %s', sql)
-    with pymysql.connect(user=self.user,
-                         password=self.password,
-                         host=self.host,
-                         port=self.port,
-                         database=self.database,
-                         cursorclass=pymysql.cursors.DictCursor,
-                         **self.extra_client_params,
-                         ) as cursor:
+    with self._connection.cursor() as cursor:
       cursor.execute(sql)
       result = cursor.fetchall()
       return result
@@ -290,14 +282,7 @@ class _BoundedMysqlSource(iobase.BoundedSource):
       if self.sql is not None:
         sql = self.sql
         extra_client_params = self.extra_client_params.pop('cursorclass')
-        with pymysql.connect(user=self.user,
-                             password=self.password,
-                             host=self.host,
-                             port=self.port,
-                             database=self.database,
-                             cursorclass=pymysql.cursors.DictCursor,
-                             **extra_client_params,
-                             ) as cursor:
+        with self._connection.cursor() as cursor:
           cursor.execute(sql)
           columns = cursor.fetchone().keys()
       else:
@@ -308,13 +293,7 @@ class _BoundedMysqlSource(iobase.BoundedSource):
         ORDER BY `TABLE_NAME`, `ORDINAL_POSITION`
         """.format(
           database=self.database, table=self.table)
-        with pymysql.connect(user=self.user,
-                             password=self.password,
-                             host=self.host,
-                             port=self.port,
-                             database=self.database,
-                             **self.extra_client_params,
-                             ) as cursor:
+        with self._connection.cursor() as cursor:
           cursor.execute(sql)
           columns = [col[0] for col in cursor.fetchall()]
       self._columns = columns
@@ -333,13 +312,7 @@ class _BoundedMysqlSource(iobase.BoundedSource):
       """.format(table=self.table)
       _LOGGER.debug('Finding primary key using sql: %s', sql)
 
-      with pymysql.connect(user=self.user,
-                           password=self.password,
-                           host=self.host,
-                           port=self.port,
-                           database=self.database,
-                           **self.extra_client_params,
-                           ) as cursor:
+      with self._connection.cursor() as cursor:
         cursor.execute(sql)
         self._primary_key = cursor.fetchone()[0]
         _LOGGER.debug('Primary key for %s is %s', self.table, self.primary_key)
@@ -355,13 +328,7 @@ class _BoundedMysqlSource(iobase.BoundedSource):
   def mysql_version(self):
     if self._mysql_version is None:
       sql = 'SELECT VERSION()'
-      with pymysql.connect(user=self.user,
-                           password=self.password,
-                           host=self.host,
-                           port=self.port,
-                           database=self.database,
-                           **self.extra_client_params,
-                           ) as cursor:
+      with self._connection.cursor() as cursor:
         cursor.execute(sql)
         mysql_version = cursor.fetchone()[0]
         _LOGGER.debug('Using MySQL version %s', mysql_version)
@@ -613,3 +580,75 @@ class _MySQLSink(object):
     if self.connection is not None:
       self.connection.commit()
       self.connection.close()
+
+
+class _MysqlConnectionHelper(object):
+  """A Utility class to hold parameters for establishing a connection
+  to Mysql."""
+  def __init__(self,
+               user,
+               password,
+               host,
+               database,
+               port=None,
+               extra_client_params=None,
+               ):
+    if extra_client_params is None:
+      extra_client_params = {}
+
+    self.user = user
+    self.password = password
+    self.host = host
+    self.database = database
+    self.port = port
+    self.extra_client_params = extra_client_params
+
+  @contextmanager
+  def connect(self, dictcursor=False):
+    extra_client_params = copy.deepcopy(self.extra_client_params)
+
+    if dictcursor:
+      extra_client_params['cursorclass'] = pymysql.cursors.DictCursor
+    try:
+      conn = pymysql.connect(
+        user=self.user,
+        password=self.password,
+        host=self.host,
+        port=self.port,
+        database=self.database,
+        **extra_client_params,
+      )
+      yield conn
+    finally:
+      conn.close()
+
+  @contextmanager
+  def cursor(self, dictcursor=False):
+    with self.connect(dictcursor) as conn:
+      try:
+        cursor = conn.cursor()
+        yield cursor
+      finally:
+        cursor.close()
+
+
+class _MysqlHelper(object):
+  """A Utility class to capture common Mysql operations."""
+  @classmethod
+  def query(cls, sql):
+    """
+    A convenient method to construct _MysqlHelper from a sql query.
+    Args:
+      sql: SQL query statement
+    """
+    raise NotImplementedError
+
+  @classmethod
+  def table(cls, table, columns, ordering_col=None):
+    """
+    A convenient method to construct _MysqlHelper from a table
+    Args:
+      table(str): MySQL Table to read or write to
+      port(int): Optional MySQL port to connect to, defaults to standard MySQL port 3306
+      columns(List[str]): Optional list of columns to select from the table
+    """
